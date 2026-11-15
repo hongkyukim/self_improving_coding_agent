@@ -1,11 +1,12 @@
 jsonlines
+pyyaml
 cryptography
 datasets
 tiktoken
 pydantic[email]
 pydantic-settings
 python-dotenv
-anthropic[vertex]==0.42.0
+anthropic[vertex]>=2.8.0,<3
 tabulate
 openai
 json-repair

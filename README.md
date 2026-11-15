@@ -23,8 +23,9 @@ First, make sure you've cloned the repo
 git clone https://github.com/MaximeRobeyns/self_improving_coding_agent
 ```
 
-Then, export some environment variables which will be made available in the
-docker container. The project supports inference from a number of providers to
+Then, export some environment variables in the shell from which you run the
+agent. They are handed to each docker container when it is started, and are
+not stored in the docker image. The project supports inference from a number of providers to
 allow for experimentation across many models. You must export at least one of
 these in your _local_ shell, which you can do either directly or with `direnv`,
 `dotenv`, etc. Omitting any provider key will simply make that provider's
@@ -40,9 +41,11 @@ export DEEPSEEK_API_KEY=  # For DeepSeek direct inference (V3, R1)
 export MODAL_TOKEN_ID=  # To allow the agent to visit webpages and read papers
 export MODAL_TOKEN_SECRET=  # To allow the agent to visit webpages and read papers
 ```
-For gemini, you should replace the template file in `sandbox/GOOGLE_APPLICATION_CREDENTIALS.json` with your own credentials.
+For gemini, you should replace the template file in `sandbox/GOOGLE_APPLICATION_CREDENTIALS.json` with your own credentials. This file is mounted into the containers read-only; it is not copied into the image either.
 
-Once you have at least one LLM provider's API key exported, you can build the docker image. The build command is wrapped in a Makefile target for convenience:
+> If you built the image with an earlier version of this repository, your API keys are stored in it. Rebuild it, and remove the old images (`docker image ls sica_sandbox`, then `docker image rm <id>`), before sharing or pushing an image anywhere.
+
+Next, build the docker image. The build command is wrapped in a Makefile target for convenience:
 
 ```bash
 make image
@@ -89,9 +92,13 @@ To further configure the agent, including the choice of LLMs, edit `base_agent/s
 
 ## Self-Improvement Loop
 
-To run the self-improvement loop, first inspect the list of benchmarks in the `base_agent/src/benchmarks/__init__.py` file, and make sure that you have uncommented those you want to include. Then do
+To run the self-improvement loop, do
 ```bash
 python runner.py
+```
+This runs the `gsm8k` benchmark. To run others, name them (`python runner.py --help` lists those available, which are defined in `base_agent/src/benchmarks/__init__.py`):
+```bash
+python runner.py --benchmarks gsm8k humaneval file_editing
 ```
 To see all the options, do
 ```bash
@@ -103,6 +110,11 @@ python runner.py --id 1 --workers 6
 ```
 
 This will start the agent loop, placing the results in `results/run_<id>`.
+
+Instead of a long command line, settings can be kept in a YAML file. `run.example.yaml` lists all of them with their defaults; options given on the command line take precedence over the file.
+```bash
+python runner.py --config run.example.yaml --children 2
+```
 
 By default each new agent is built from the latest agent that is not significantly worse than the best one (`greedy_ci`). Two sampling strategies are also available, which spread the search over more of the archive:
 ```bash
@@ -120,6 +132,13 @@ By default the best-scoring agent carries out each improvement. `--meta-agent` c
 python runner.py --meta-agent seed --meta-model SONNET_37
 ```
 
+Before a new agent is evaluated it has to pass a validation gate, run in its own sandbox: its code imports, its unit tests pass (unless its parent's did not either), and it solves a trivial problem end to end. An agent that does not is marked `invalid`, and is neither evaluated nor built upon. The initial agent is checked once when a run starts, so that a broken setup is noticed before anything is spent.
+```bash
+python runner.py --gate-retries 1         # let the meta agent try to fix an agent that fails the gate
+python runner.py --gate-checks import     # only some of the checks (import, tests, smoke)
+python runner.py --gate-checks none       # no gate
+```
+
 Scores on a handful of problems are noisy, and three options make the evaluation more trustworthy or cheaper:
 ```bash
 python runner.py --repeats 3            # run every problem 3 times and average
@@ -129,7 +148,9 @@ python runner.py --stage1-size 8        # try new agents on 8 problems per bench
 - With `--holdout-fraction`, results on the held-out problems go to `results/holdout/run_<id>/` (same layout as the experiment directory). Agents never see them, so a gain that shows up on the archive problems but not on the held-out ones is overfitting. The split can only be chosen when an experiment is started.
 - With `--stage1-size`, an agent that is clearly worse than its parent on the first-stage problems is not evaluated further and not built upon (`--promote-threshold` sets how much worse is tolerated).
 
-These settings are stored with the experiment and kept when it is resumed.
+Each problem has a time and a cost limit (`--timeout-s`, default 600; `--cost-limit-usd`, default 3), and `--subset-size` sets how many problems are taken from each benchmark (default 18; 0 for all).
+
+These settings are stored with the experiment and kept when it is resumed. The choice of problems (`--subset-size`, `--benchmark-seed`, `--holdout-fraction`) cannot be changed once agents have been evaluated.
 
 To see how an experiment went (the tree of agents, progress and cost per generation, archive vs held-out scores, and how parents were selected), or how much several experiments differ from run to run:
 ```bash

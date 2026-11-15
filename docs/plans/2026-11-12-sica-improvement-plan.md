@@ -124,7 +124,15 @@ class ParentSelector(Protocol):
 
 ## Phase 1 — 기반 안정화
 
-### 1-1. 검증 게이트 (F5)
+### 1-1. 검증 게이트 (F5) (구현 완료)
+
+구현 메모:
+- 게이트는 새 에이전트 자신의 이미지로 띄운 별도 컨테이너에서 돈다. 코드는 읽기 전용으로 마운트한 뒤 컨테이너 안으로 복사해, 테스트가 남기는 캐시가 에이전트 코드에 섞이지 않게 한다.
+- 테스트 검사는 "부모도 실패하던 테스트"는 문제 삼지 않는다. seed의 테스트가 샌드박스에서 원래 실패하면 모든 자식이 탈락하기 때문이다. 각 에이전트의 테스트 결과는 `lineage.json`의 `tests_passed`에 남는다.
+- 실험 시작 시 초기 에이전트에 게이트를 한 번 돌린다. import나 스모크 실행이 실패하면 환경 문제이므로 아무 비용도 쓰기 전에 멈춘다.
+- 스모크 실행은 기본적으로 에이전트 자신의 모델을 쓴다 (계획의 "저가 모델"은 `--gate-model`로 지정). 다른 제공사의 저가 모델을 기본값으로 하면 그 API 키가 없는 환경에서 게이트가 전부 실패한다.
+- `--gate-retries`의 재시도는 메타 에이전트를 일반 모드(`python -m ….agent --prompt`)로 다시 불러 실패 로그를 주고 고치게 한다. 이 호출의 비용은 사용량 줄을 출력하지 않아 `usage`에 잡히지 않는다.
+- 이미지 빌드 실패는 재시도 없이 `failed`로 남는다.
 
 메타 개선 직후, 평가 전에 컨테이너 안에서 순서대로 실행한다.
 
@@ -134,20 +142,34 @@ class ParentSelector(Protocol):
 
 하나라도 실패하면 `status: "invalid"`로 기록하고 평가를 건너뛴다. `--gate-retries N`이면 실패 로그를 붙여 메타 개선을 다시 시도한다.
 
-### 1-2. 시크릿 런타임 주입 (F7)
+### 1-2. 시크릿 런타임 주입 (F7) (구현 완료)
+
+구현 메모: 계획의 `--env-file`(임시 파일) 대신 `docker run -e NAME`(값 없이 이름만)을 쓴다. Docker가 runner 프로세스의 환경에서 값을 가져오므로 키가 명령줄에도, 디스크에도 남지 않는다. `VERTEX_REGION`도 전달 대상에 넣었다. Makefile의 `int`, `meta`, `test_meta_int`도 같은 방식으로 키를 넘긴다.
 
 - Dockerfile의 `ARG`/`ENV` 키 블록 삭제. `docker run`에 `--env-file`(runner가 0600 권한 임시 파일로 생성) 전달.
 - `runner.py:936-962`와 `Makefile`의 `--build-arg` 키 전달 삭제.
 - `sandbox/GOOGLE_APPLICATION_CREDENTIALS.json`은 이미지에 COPY하지 않고 읽기 전용 마운트.
 - 기존 이미지에는 키가 레이어에 남아 있으므로 재빌드 후 이전 이미지를 삭제하도록 README에 안내.
 
-### 1-3. 설정 파일화 (F8)
+### 1-3. 설정 파일화 (F8) (구현 완료, F9 포함)
+
+구현 메모:
+- 설정 정의는 `runner_config.py`의 `RunnerSettings`(pydantic) 한 곳에 있다. 우선순위는 기본값 < `--config` YAML 파일 < 명령줄. 모든 설정에 명령줄 옵션이 있고 `run.example.yaml`이 전부를 설명한다.
+- 평가 설정(벤치마크, 문제 수, 한도, 반복, holdout, 단계)은 `metadata.json`의 `evaluation`에 저장되고 재개 시 유지된다. 문제 선택(`subset_size`, `benchmark_seed`, `holdout_fraction`)은 평가 결과가 생긴 뒤 바꿀 수 없다. 이번 실행에 쓴 전체 설정은 `runner_settings`에 남는다.
+- `benchmark_registry`에는 18개가 모두 등록되고, 실행할 것은 `benchmarks` 설정으로 고른다 (기본 `gsm8k`).
+- F9: utility 한도는 실험의 `timeout_s`/`cost_limit_usd`를 쓴다 (기록이 없는 아카이브는 기존 $3, 300초). 벤치마크 utility는 문제별 utility의 평균으로 바꿨다. 이전에는 벤치마크 전체 합계를 문제당 한도와 비교해 거의 항상 0이었다.
+- 시간 초과로 강제 종료된 실행은 남긴 답으로 채점해 확정한다 (`timed_out` 표시, 토큰·비용은 0). 이전에는 채점 분기에 도달하지 못해 재개할 때마다 다시 실행됐다.
 
 - `runner_config.py`(pydantic-settings, `base_agent/src/config.py`와 같은 방식): `timeout_s`, `cost_limit_usd`, `subset_size`, `seed`, `repeats`, `benchmarks: list[str]`, `workers`.
 - `--config run.yaml` + CLI 오버라이드. 사용한 설정 전체를 `metadata.json`에 저장.
 - `benchmark_registry`는 전부 등록하고, 실행할 것만 설정의 이름 목록으로 고른다 (주석 해제 방식 제거).
 
-### 1-4. 결과 프로토콜과 상태 저장 (F10)
+### 1-4. 결과 프로토콜과 상태 저장 (F10) (구현 완료)
+
+구현 메모:
+- `usage.json`의 필드는 `lineage.json`의 `usage`와 같은 `{tokens, cached_tokens, cost, time}`로 맞췄다. 에이전트의 세 진입점(benchmark, improve, 일반 실행)이 모두 쓴다.
+- 일반 실행도 사용량을 남기므로, 검증 게이트의 수정 재시도 비용이 에이전트의 `usage`에 합산된다 (새 seed에서 나온 메타 에이전트부터).
+- 실패 사유는 `results.jsonl` 행의 `error`에 남는다. 점수는 비워 두므로 재개 시 다시 시도하는 기존 동작은 그대로다.
 
 - 에이전트가 `logdir/usage.json`(`{tokens, cached, cost, wall_time}`)을 쓰고 runner가 읽는다. 이전 세대 에이전트와의 호환을 위해 stdout 파싱은 fallback으로 남긴다.
 - `update_metadata`를 임시 파일 + `os.replace`로 원자적 쓰기.

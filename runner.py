@@ -16,6 +16,7 @@ import argparse
 import subprocess
 
 from uuid import uuid4
+from contextlib import asynccontextmanager
 from typing import Type
 from pathlib import Path
 from datetime import datetime
@@ -28,10 +29,13 @@ from base_agent.src.utils.archive_analysis import (
     base_problem_id,
     result_id,
 )
+from base_agent.src.utils.usage import USAGE_FILENAME, read_usage
 from base_agent.src.utils.lineage import (
     STATUS_OK,
     STATUS_FAILED,
+    STATUS_INVALID,
     STATUS_PENDING,
+    FINISHED_STATUSES,
     read_lineage,
     write_lineage,
     child_generation,
@@ -49,6 +53,15 @@ from search.selection import (
     selection_rng,
 )
 from search.changelog import render_other_branches, update_change_log
+from runner_config import META_AGENT_CHOICES, RunnerSettings, resolve_settings
+from search.gate import (
+    AGENT_CODE_DIR,
+    GateConfig,
+    GateResult,
+    check_tests,
+    fix_prompt,
+    run_gate,
+)
 from search.evaluation import (
     EvaluationConfig,
     holdout_dir,
@@ -70,6 +83,29 @@ benchmark_locks = {}
 # of their own, tagged SANDBOX_IMAGE:run{exp_id}_agent{agent_id}.
 SANDBOX_IMAGE = "sica_sandbox"
 
+# Credentials are not built into the sandbox image, but handed to each
+# container when it is started. These variables are passed on if set:
+SANDBOX_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "FIREWORKS_AI_API_KEY",
+    "GEMINI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "VERTEX_PROJECT_ID",
+    "VERTEX_REGION",
+)
+# and this file, if it exists, is mounted read-only:
+GOOGLE_CREDENTIALS_FILE = Path("sandbox/GOOGLE_APPLICATION_CREDENTIALS.json")
+CONTAINER_GOOGLE_CREDENTIALS = "/tmp/GOOGLE_APPLICATION_CREDENTIALS.json"
+
+# How long a benchmark run may go over its time limit before it is cut off
+TIMEOUT_GRACE_SECONDS = 10
+
+# Limits for the meta agent when it is asked to fix an agent that failed the
+# validation gate
+GATE_FIX_TIMEOUT_SECONDS = 30 * 60
+GATE_FIX_COST_THRESHOLD_USD = 5.0
+
 # The agent's monitoring web server listens on this port inside the container
 MONITOR_CONTAINER_PORT = 8080
 # Publish it on a free host port chosen by docker (loopback only), so that any
@@ -77,9 +113,6 @@ MONITOR_CONTAINER_PORT = 8080
 MONITOR_PORT_MAPPING = f"127.0.0.1::{MONITOR_CONTAINER_PORT}"
 
 # Utility functions ------------------------------------------------------------
-
-
-META_AGENT_CHOICES = ("best", "parent", "seed")
 
 
 def parse_meta_agent(value: str) -> str | int:
@@ -98,66 +131,122 @@ def parse_meta_agent(value: str) -> str | int:
 
 
 def setup_argparse() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Self referential agent")
+    """The command line. Options have no defaults here: an option that is not
+    given takes its value from the config file, or else its default, both of
+    which are in runner_config.RunnerSettings (see settings_from_args)."""
+    parser = argparse.ArgumentParser(
+        description="Self referential agent",
+        epilog="Every option can also be set in a YAML file given with --config "
+        "(see run.example.yaml); options on the command line take precedence.",
+    )
     parser.add_argument(
         "--experiment-id", "-id", type=int, help="ID of experiment to resume"
     )
-    parser.add_argument(
-        "--iterations", "-n", type=int, default=20, help="Number of iterations to run"
+    parser.add_argument("--config", type=Path, help="YAML file with settings")
+
+    search = parser.add_argument_group("search")
+    search.add_argument(
+        "--iterations", "-n", type=int, help="Number of iterations to run (default: 20)"
     )
-    parser.add_argument(
-        "--workers", type=int, default=8, help="Number of parallel problem workers"
+    search.add_argument(
+        "--workers", type=int, help="Number of parallel problem workers (default: 8)"
     )
-    parser.add_argument(
+    search.add_argument(
         "--children",
         type=int,
-        default=1,
-        help="Number of new agents to create per iteration, each from its own selected parent",
+        help="Number of new agents to create per iteration, each from its own selected parent (default: 1)",
     )
-    parser.add_argument(
+    search.add_argument(
         "--selection",
         choices=SELECTION_STRATEGIES,
-        default=DEFAULT_SELECTION_STRATEGY,
-        help="How to select the agent that the next agent is built from",
+        help=f"How to select the agent that the next agent is built from (default: {DEFAULT_SELECTION_STRATEGY})",
     )
-    parser.add_argument(
+    search.add_argument(
         "--seed",
         type=int,
         help="Seed for parent selection (default: the experiment's stored seed, or a new random one)",
     )
-    parser.add_argument(
+    search.add_argument(
         "--meta-agent",
         type=parse_meta_agent,
-        default="best",
         metavar="{best,parent,seed,<id>}",
         help="Which agent carries out the improvement of a new agent: the best-scoring "
         "agent (default), the new agent's parent, the initial agent, or a fixed agent id",
     )
-    parser.add_argument(
+    search.add_argument(
         "--meta-model",
         choices=[model.name for model in Model],
         metavar="MODEL",
         help="Model that the meta agent uses while improving an agent (default: the "
         "meta agent's own configured model). Benchmarks are unaffected.",
     )
-    parser.add_argument(
+
+    gate = parser.add_argument_group("validation gate")
+    gate.add_argument(
+        "--gate-checks",
+        metavar="CHECKS",
+        help="Checks that a new agent must pass before it is evaluated, comma separated: "
+        "import (its code imports), tests (its unit tests pass, unless its parent's "
+        "did not either), smoke (it solves a trivial problem). 'none' switches the "
+        "gate off (default: import,tests,smoke)",
+    )
+    gate.add_argument(
+        "--gate-retries",
+        type=int,
+        help="How often the meta agent is asked to fix a new agent that fails the gate (default: 0)",
+    )
+    gate.add_argument(
+        "--gate-model",
+        choices=[model.name for model in Model],
+        metavar="MODEL",
+        help="Model for the gate's smoke run (default: the agent's own configured model)",
+    )
+
+    evaluation = parser.add_argument_group(
+        "evaluation",
+        "Stored with the experiment: when resuming, options that are not given keep "
+        "their stored value. The choice of problems (--subset-size, --benchmark-seed, "
+        "--holdout-fraction) cannot be changed once agents have been evaluated.",
+    )
+    evaluation.add_argument(
+        "--benchmarks",
+        nargs="+",
+        metavar="NAME",
+        help="Benchmarks to run (default: gsm8k). Available: "
+        + ", ".join(benchmark_registry),
+    )
+    evaluation.add_argument(
+        "--subset-size",
+        type=int,
+        help="Number of problems to take from each benchmark; 0 for all (default: 18)",
+    )
+    evaluation.add_argument(
+        "--benchmark-seed", type=int, help="Seed of the choice of problems (default: 1)"
+    )
+    evaluation.add_argument(
+        "--timeout-s", type=int, help="Time limit per problem, in seconds (default: 600)"
+    )
+    evaluation.add_argument(
+        "--cost-limit-usd", type=float, help="Cost limit per problem, in USD (default: 3)"
+    )
+    evaluation.add_argument(
         "--repeats",
         type=int,
         help="Number of times to run each benchmark problem (default: 1)",
     )
-    parser.add_argument(
+    evaluation.add_argument(
         "--holdout-fraction",
         type=float,
         help="Share of each benchmark's problems to keep out of the archive that agents see; "
         "can only be set when an experiment is started (default: 0)",
     )
-    parser.add_argument(
+    evaluation.add_argument(
         "--stage1-size",
         type=int,
         help="Evaluate new agents on this many problems per benchmark first, and in full "
         "only if they are not clearly worse than their parent (default: 0, always in full)",
     )
-    parser.add_argument(
+    evaluation.add_argument(
         "--promote-threshold",
         type=float,
         help="With --stage1-size: evaluate in full unless the agent is worse than its "
@@ -172,6 +261,19 @@ def setup_argparse() -> argparse.ArgumentParser:
     test_parser.add_argument("--name", default="gsm8k", help="Benchmark ID to run")
 
     return parser
+
+
+def settings_from_args(args: argparse.Namespace) -> RunnerSettings:
+    """The settings of this invocation: defaults, overridden by the config
+    file, overridden by the command line.
+
+    Raises:
+        ValueError: if a setting is unknown or invalid
+    """
+    cli = {
+        name: getattr(args, name, None) for name in RunnerSettings.model_fields
+    }
+    return resolve_settings(args.config, cli)
 
 
 def get_next_dir_number(base_dir: str | Path) -> int:
@@ -191,6 +293,28 @@ def get_next_dir_number(base_dir: str | Path) -> int:
     if not numbered_dirs:
         return 1
     return max(numbered_dirs) + 1
+
+
+def sandbox_secret_args() -> list[str]:
+    """`docker run` arguments that give a container its credentials.
+
+    Variables are passed by name only (`-e NAME`): docker takes the value
+    from this process's environment, so that it never appears on a command
+    line, in a log, or in a file. Commands run later with `docker exec`
+    inherit them.
+    """
+    args: list[str] = []
+    for name in SANDBOX_ENV_VARS:
+        if os.environ.get(name):
+            args += ["-e", name]
+    if GOOGLE_CREDENTIALS_FILE.is_file():
+        args += [
+            "-v",
+            f"{GOOGLE_CREDENTIALS_FILE.absolute()}:{CONTAINER_GOOGLE_CREDENTIALS}:ro",
+            "-e",
+            f"GOOGLE_APPLICATION_CREDENTIALS={CONTAINER_GOOGLE_CREDENTIALS}",
+        ]
+    return args
 
 
 async def run_docker_command(*args) -> tuple[bool, str, str]:
@@ -258,6 +382,18 @@ async def wait_for_container_ready(container_name: str, timeout: float = 30):
     )
 
 
+def write_json_atomic(path: Path, data) -> None:
+    """Write a JSON file so that it is either the old or the new version in
+    full: a crash while writing cannot leave a truncated file behind."""
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex[:8]}.tmp")
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def load_metadata(exp_dir: Path) -> dict:
     """Load the experiment metadata, creating if doesn't exist"""
     metadata_file = exp_dir / "metadata.json"
@@ -282,8 +418,7 @@ def load_metadata(exp_dir: Path) -> dict:
         except subprocess.CalledProcessError:
             pass
 
-        with open(metadata_file, "w") as f:
-            json.dump(metadata, f, indent=2)
+        write_json_atomic(metadata_file, metadata)
     else:
         with open(metadata_file) as f:
             metadata = json.load(f)
@@ -294,8 +429,7 @@ def update_metadata(exp_dir: Path, **kwargs) -> None:
     """Update specific metadata fields"""
     metadata = load_metadata(exp_dir)
     metadata.update(kwargs)
-    with open(exp_dir / "metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
+    write_json_atomic(exp_dir / "metadata.json", metadata)
 
 
 def resolve_selection_seed(exp_dir: Path, seed: int | None = None) -> int:
@@ -316,40 +450,51 @@ def resolve_selection_seed(exp_dir: Path, seed: int | None = None) -> int:
     return seed
 
 
+# Evaluation settings that decide which problems agents are run on
+PROBLEM_CHOICE_SETTINGS = ("subset_size", "benchmark_seed", "holdout_fraction")
+
+
 def resolve_evaluation_config(
-    exp_dir: Path,
-    seed: int,
-    repeats: int | None = None,
-    holdout_fraction: float | None = None,
-    stage1_size: int | None = None,
-    promote_threshold: float | None = None,
+    exp_dir: Path, seed: int, **given
 ) -> EvaluationConfig:
     """How agents are evaluated in this experiment.
 
-    Settings not given keep the value stored with the experiment. The holdout
-    split is fixed once agents have been evaluated: changing it would show
-    held-out problems to the agents, and make results incomparable.
+    `given` holds evaluation settings (fields of EvaluationConfig) asked for
+    in this invocation; None or absent means not asked for. Those keep the
+    value stored with the experiment, or the default for a new experiment.
+
+    The choice of problems is fixed once agents have been evaluated: with
+    other problems, results would no longer be comparable between agents,
+    and held-out problems could end up in the archive that agents see.
 
     Raises:
-        ValueError: for invalid settings, or an attempt to change the split
+        ValueError: for invalid settings, unknown benchmarks, or an attempt
+            to change the choice of problems
     """
     stored = load_metadata(exp_dir).get("evaluation")
     current = EvaluationConfig(**stored) if stored else EvaluationConfig(split_seed=seed)
-    given = {
-        "repeats": repeats,
-        "holdout_fraction": holdout_fraction,
-        "stage1_size": stage1_size,
-        "promote_threshold": promote_threshold,
-    }
-    config = EvaluationConfig(
-        **{**current.to_dict(), **{k: v for k, v in given.items() if v is not None}}
-    )
-    has_results = any(exp_dir.glob("agent_*/benchmarks"))
-    if has_results and config.holdout_fraction != current.holdout_fraction:
+    asked = {key: value for key, value in given.items() if value is not None}
+    config = EvaluationConfig(**{**current.to_dict(), **asked})
+
+    unknown = [name for name in config.benchmarks if name not in benchmark_registry]
+    if unknown:
         raise ValueError(
-            f"The holdout fraction of this experiment is {current.holdout_fraction} and "
-            "cannot be changed now that agents have been evaluated"
+            f"Unknown benchmark(s) {', '.join(unknown)}; available: {', '.join(benchmark_registry)}"
         )
+
+    if any(exp_dir.glob("agent_*/benchmarks")):
+        for name in PROBLEM_CHOICE_SETTINGS:
+            old, new = getattr(current, name), getattr(config, name)
+            if old != new:
+                raise ValueError(
+                    f"{name} of this experiment is {old} and cannot be changed "
+                    f"(to {new}) now that agents have been evaluated"
+                )
+        if config.benchmarks != current.benchmarks:
+            logger.warning(
+                f"Benchmarks changed from {list(current.benchmarks)} to {list(config.benchmarks)}: "
+                "overall scores of agents evaluated before and after are not comparable"
+            )
     if config.to_dict() != stored:
         update_metadata(exp_dir, evaluation=config.to_dict())
     return config
@@ -391,8 +536,7 @@ async def update_benchmark_progress(
             metadata["benchmark_progress"][benchmark_name]["completed"] += 1
 
         # Save metadata
-        with open(metadata_file, "w") as f:
-            json.dump(metadata, f, indent=2)
+        write_json_atomic(metadata_file, metadata)
 
 
 async def generate_contextual_summary(
@@ -499,14 +643,17 @@ async def process_job(
     worker_id: int,
     image: str = SANDBOX_IMAGE,
     results_exp_dir: Path | None = None,
+    timeout_s: int = 600,
+    cost_limit_usd: float = 3.0,
 ) -> bool:
     """Process a single benchmark problem job
 
     The results go to the agent's directory in `results_exp_dir`, which
     mirrors the layout of the experiment directory (and defaults to it).
+    `timeout_s` and `cost_limit_usd` are the limits for this one problem.
     """
-    TIMEOUT_SECONDS = 10 * 60  # 10 minutes timeout
-    COST_THRESHOLD_USD = 3.00  # 3 USD cost limit per problem
+    TIMEOUT_SECONDS = timeout_s
+    COST_THRESHOLD_USD = cost_limit_usd
 
     benchmark = job.benchmark
     problem = job.problem
@@ -544,6 +691,14 @@ async def process_job(
     timed_out = False
     cost_threshold_exceeded = False
 
+    async def record_failure(reason: str, **fields) -> None:
+        """Keep the reason with the problem's result. Its score stays unset,
+        so that it is attempted again when the experiment is resumed."""
+        async with benchmark_lock:
+            results_tracker.update_problem(
+                job.result_id, error=reason[-2000:], **fields
+            )
+
     # Create unique container name
     local_id = f"agent_{uuid4().hex[:8]}"
     container_name = f"sica_{benchmark.name}_{job.result_id}_{local_id}"
@@ -563,6 +718,7 @@ async def process_job(
             container_name,
         ]
         container_cmd += ["-p", MONITOR_PORT_MAPPING]
+        container_cmd += sandbox_secret_args()
         # Mount the experiment directory (results/run_{i})
         container_cmd += [
             "-v",
@@ -585,6 +741,7 @@ async def process_job(
             logger.error(
                 f"Failed to start container for {job.result_id}: {stderr}"
             )
+            await record_failure(f"Could not start container: {stderr}")
             return False
 
         await wait_for_container_ready(container_name)
@@ -627,11 +784,14 @@ async def process_job(
             agent_cmd += ["--timeout", str(TIMEOUT_SECONDS)]
             agent_cmd += ["--cost-threshold", str(COST_THRESHOLD_USD)]
 
+            # A report left by an earlier attempt must not be taken for this one's
+            (logdir / USAGE_FILENAME).unlink(missing_ok=True)
+
             try:
                 # An additional safety feature; if timeout cancellation
                 # doesn't happen at the application layer, we cancel
                 # the docker container
-                async with asyncio.timeout(TIMEOUT_SECONDS + 10):
+                async with asyncio.timeout(TIMEOUT_SECONDS + TIMEOUT_GRACE_SECONDS):
                     success, stdout, stderr = await run_docker_command(
                         "docker", "exec", container_name, *agent_cmd
                     )
@@ -655,12 +815,20 @@ async def process_job(
                 else:
                     trace_path.write_text(timeout_msg)
 
-            if not success:
+            # A run that had to be cut off is not a failed attempt to be
+            # repeated: it is scored on whatever answer it left, below.
+            if not success and not timed_out:
                 logger.error(f"Problem {job.result_id} failed: {stderr}")
+                await record_failure(stderr or "The agent exited with an error")
                 return False
 
             if not timed_out:
-                tokens, cached, cost, time = stdout.splitlines()[-1].split("|")
+                usage = read_agent_usage(logdir, stdout)
+                if usage is None:
+                    raise ValueError("The agent did not report its usage")
+                tokens, cached, cost, time = (
+                    usage["tokens"], usage["cached_tokens"], usage["cost"], usage["time"]
+                )  # fmt: skip
                 percent_cached = (
                     int(cached) / int(tokens) * 100 if int(tokens) > 0 else 0
                 )
@@ -678,7 +846,8 @@ async def process_job(
                     f"{job.result_id} | tokens: {tokens} (cached: {percent_cached:.2f}%), cost: ${float(cost):.4f}, duration: {float(time):.2f}s"
                 )
             else:
-                # Use placeholder values for timeout cases that exceed grace period
+                # The run was cut off, so it did not report what it used: the
+                # time is known, tokens and cost are not
                 tokens, cached, cost, time = 0, 0, 0, str(TIMEOUT_SECONDS)
 
             # Score the answer
@@ -702,6 +871,7 @@ async def process_job(
                     score=float(score),
                     timed_out=timed_out,
                     cost_threshold_exceeded=cost_threshold_exceeded,
+                    error=None,
                 )
 
             answer_path = logdir / "answer.txt"
@@ -745,6 +915,7 @@ async def process_job(
 
         except Exception as e:
             logger.error(f"Error processing problem {job.result_id}: {e}")
+            await record_failure(f"{type(e).__name__}: {e}")
             return False
     finally:
         # Cleanup running docker container
@@ -805,6 +976,10 @@ async def run_benchmarks_with_job_queue(
     results_exp_dir: Path | None = None,
     select_problems=None,
     repeats: int = 1,
+    subset_size: int = 18,
+    benchmark_seed: int = 1,
+    timeout_s: int = 600,
+    cost_limit_usd: float = 3.0,
 ) -> None:
     """Run multiple benchmarks concurrently using a job queue approach
 
@@ -813,6 +988,10 @@ async def run_benchmarks_with_job_queue(
         select_problems: Given a benchmark, returns the problems of it to run
             (default: all of them)
         repeats: Number of times to run each problem
+        subset_size: Number of problems to take from each benchmark (0: all)
+        benchmark_seed: Seed of that choice of problems
+        timeout_s: Time limit for a problem
+        cost_limit_usd: Cost limit for a problem
     """
     results_exp_dir = results_exp_dir or exp_dir
     results_agent_dir = results_exp_dir / agent_dir.name
@@ -834,8 +1013,7 @@ async def run_benchmarks_with_job_queue(
     benchmarks_dict = {}
 
     for benchmark_cls in benchmarks:
-        benchmark = benchmark_cls(seed=1, subset_size=18)
-        # benchmark = benchmark_cls(seed=1, subset_size=None)  # For full benchmarks
+        benchmark = benchmark_cls(seed=benchmark_seed, subset_size=subset_size or None)
         logger.info(f"Initializing benchmark: {benchmark.name}")
 
         benchmark_dir = results_agent_dir / "benchmarks" / benchmark.name
@@ -890,7 +1068,14 @@ async def run_benchmarks_with_job_queue(
                     # Process the job
                     logger.info(f"Worker {worker_id} processing job {job}")
                     await process_job(
-                        exp_dir, agent_dir, job, worker_id, image, results_exp_dir
+                        exp_dir,
+                        agent_dir,
+                        job,
+                        worker_id,
+                        image,
+                        results_exp_dir,
+                        timeout_s,
+                        cost_limit_usd,
                     )
                 except Exception as e:
                     logger.error(f"Error in worker {worker_id} processing {job}: {e}")
@@ -935,7 +1120,10 @@ async def resolve_agent_image(exp_id: int, agent_id: int) -> str:
 
 async def build_agent_image(tag: str, agent_code_dir: Path) -> tuple[bool, str]:
     """Build the sandbox image for an agent, installing the requirements.txt
-    of that agent's code. Returns (success, stderr)."""
+    of that agent's code. Returns (success, stderr).
+
+    No credentials go into the image: see sandbox_secret_args.
+    """
     target_arch = "x86_64"  # Default architecture
     # Detect if the script is running on a Mac with Apple Silicon
     if platform.system() == "Darwin" and platform.processor() == "arm":
@@ -943,18 +1131,140 @@ async def build_agent_image(tag: str, agent_code_dir: Path) -> tuple[bool, str]:
     build_cmd = ["docker", "buildx", "build"]
     build_cmd += ["--build-context", f"base_agent={agent_code_dir.absolute()}"]
     build_cmd += ["--build-arg", f"TARGET_ARCH={target_arch}"]
-    for key in (
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "FIREWORKS_AI_API_KEY",
-        "GEMINI_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "VERTEX_PROJECT_ID",
-    ):
-        build_cmd += ["--build-arg", f"{key}={os.environ.get(key)}"]
     build_cmd += ["-f", "sandbox/Dockerfile", "-t", tag, "--load", "sandbox"]
     success, _, stderr = await run_docker_command(*build_cmd)
     return success, stderr
+
+
+def read_agent_usage(logdir: Path, stdout: str) -> dict | None:
+    """What an agent run consumed: from the usage report in its log directory
+    or, for agents from before that existed, the last line of its output."""
+    return read_usage(logdir) or parse_usage(stdout)
+
+
+def parse_usage(stdout: str) -> dict | None:
+    """The usage that an agent reports on the last line of its output, as
+    'tokens|cached tokens|cost|duration', or None if it is not there."""
+    try:
+        tokens, cached, cost, time = stdout.splitlines()[-1].split("|")
+        return {
+            "tokens": int(tokens),
+            "cached_tokens": int(cached),
+            "cost": float(cost),
+            "time": float(time),
+        }
+    except (IndexError, ValueError):
+        return None
+
+
+# Validation gate --------------------------------------------------------------
+
+
+@asynccontextmanager
+async def gate_container(exp_id: int, agent_id: int, image: str, agent_code_dir: Path):
+    """A throwaway container holding a copy of an agent's code at
+    AGENT_CODE_DIR. Yields a function that runs a command in it."""
+    name = f"sica_run_{exp_id}_agent_{agent_id}_gate_{uuid4().hex[:8]}"
+    try:
+        # The code is copied rather than mounted read-write: the checks leave
+        # caches and other files behind, which must not end up in the agent
+        success, _, stderr = await run_docker_command(
+            "docker", "run", "--rm", "-d", "--name", name,
+            *sandbox_secret_args(),
+            "-v", f"{agent_code_dir.absolute()}:/mnt/agent_code:ro",
+            image, "tail", "-f", "/dev/null",
+        )  # fmt: skip
+        if not success:
+            raise RuntimeError(f"Could not start the validation container: {stderr}")
+        await wait_for_container_ready(name)
+        success, _, stderr = await run_docker_command(
+            "docker", "exec", name, "cp", "-r", "/mnt/agent_code", AGENT_CODE_DIR
+        )
+        if not success:
+            raise RuntimeError(f"Could not copy the agent code for validation: {stderr}")
+
+        async def exec(
+            *cmd: str, env: dict[str, str] | None = None, timeout: float | None = None
+        ) -> tuple[bool, str, str]:
+            docker_cmd = ["docker", "exec"]
+            for key, value in (env or {}).items():
+                docker_cmd += ["-e", f"{key}={value}"]
+            try:
+                async with asyncio.timeout(timeout):
+                    return await run_docker_command(*docker_cmd, name, *cmd)
+            except asyncio.TimeoutError:
+                return False, "", f"Timed out after {timeout} seconds"
+
+        yield exec
+    finally:
+        await run_docker_command("docker", "rm", "-f", name)
+
+
+async def agent_tests_pass(exp_id: int, exp_dir: Path, agent_id: int) -> bool | None:
+    """Whether an agent's own unit tests pass in its sandbox. Taken from its
+    lineage record if known, and otherwise run now and recorded."""
+    agent_dir = exp_dir / f"agent_{agent_id}"
+    known = (read_lineage(agent_dir) or {}).get("tests_passed")
+    if known is not None:
+        return known
+    image = await resolve_agent_image(exp_id, agent_id)
+    async with gate_container(exp_id, agent_id, image, agent_dir / "agent_code") as exec:
+        check = await check_tests(exec)
+    write_lineage(agent_dir, tests_passed=check.raw_passed)
+    return check.raw_passed
+
+
+async def validate_agent(
+    exp_id: int, exp_dir: Path, agent_id: int, gate: GateConfig, image: str
+) -> GateResult:
+    """Run the validation gate on an agent, in the given image."""
+    agent_dir = exp_dir / f"agent_{agent_id}"
+    parent_id = (read_lineage(agent_dir) or {}).get("parent_id")
+
+    async def parent_tests_pass() -> bool | None:
+        if parent_id is None:
+            return None
+        return await agent_tests_pass(exp_id, exp_dir, parent_id)
+
+    async with gate_container(exp_id, agent_id, image, agent_dir / "agent_code") as exec:
+        return await run_gate(exec, gate, parent_tests_pass)
+
+
+async def check_initial_agent(exp_id: int, exp_dir: Path, gate: GateConfig) -> None:
+    """Run the validation gate on the initial agent, once per experiment.
+
+    If even the initial agent does not get through, the setup is at fault
+    (image, API keys) and every agent made from it would be thrown out, each
+    at the cost of a meta-improvement step. Its unit tests are the exception:
+    they set the standard for its descendants rather than having to pass.
+
+    Raises:
+        RuntimeError: if the initial agent does not pass the gate
+    """
+    agent_dir = exp_dir / "agent_0"
+    if not gate.enabled or (read_lineage(agent_dir) or {}).get("gate") is not None:
+        return
+    logger.info("Checking that the initial agent passes the validation gate")
+
+    async def no_standard_yet() -> bool:
+        return False
+
+    image = await resolve_agent_image(exp_id, 0)
+    async with gate_container(exp_id, 0, image, agent_dir / "agent_code") as exec:
+        result = await run_gate(exec, gate, no_standard_yet)
+    if not result.passed:
+        raise RuntimeError(
+            "The initial agent does not pass the validation gate, so no agent made "
+            "from it would. Check the setup (is the sandbox image built, are the API "
+            "keys exported?), or switch the gate off with --gate-checks none.\n"
+            f"{result.failure_reason()}"
+        )
+    write_lineage(agent_dir, gate=result.to_dict(), tests_passed=result.tests_passed)
+    if result.tests_passed is False:
+        logger.warning(
+            "The unit tests of the initial agent fail in the sandbox; new agents "
+            "will not be required to pass theirs"
+        )
 
 
 def set_aside(exp_dir: Path, agent_dir: Path) -> None:
@@ -967,7 +1277,9 @@ def set_aside(exp_dir: Path, agent_dir: Path) -> None:
     shutil.move(str(agent_dir), str(target))
 
 
-async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> None:
+async def run_meta_agent_benchmark(
+    exp_id: int, exp_dir: Path, child: dict, gate: GateConfig = GateConfig()
+) -> None:
     """Create a new agent version from an archived one
 
     We can conceptually think of this as a 'meta agent improvement' benchmark.
@@ -979,6 +1291,7 @@ async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> N
             `parent_id` whose code it starts from, the `meta_agent_id` that
             makes the changes (using `meta_model`, if given), and the
             `selection` record of the parent choice
+        gate: The validation that the new agent has to pass to be usable
     """
     child_id: int = child["id"]
     parent_id: int = child["parent_id"]
@@ -993,13 +1306,14 @@ async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> N
 
     if child_dir.exists():
         existing = read_lineage(child_dir) or {}
-        if existing.get("status") in (STATUS_OK, STATUS_FAILED):
+        if existing.get("status") in FINISHED_STATUSES:
             raise ValueError(f"Agent {child_id} has already been created")
         set_aside(exp_dir, child_dir)
     child_dir.mkdir(parents=True)
 
     # Record where the new agent comes from. It stays 'pending' until the meta
-    # agent has run, and is marked 'failed' if it does not complete.
+    # agent has run, and is marked 'failed' if it does not complete, or
+    # 'invalid' if what it made cannot run.
     write_lineage(
         child_dir,
         id=child_id,
@@ -1040,6 +1354,7 @@ async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> N
         container_cmd = ["docker", "run", "--rm", "-d", "--name", container_name]
         # Publish the monitoring server on a free host port
         container_cmd += ["-p", MONITOR_PORT_MAPPING]
+        container_cmd += sandbox_secret_args()
         # Mount the full agent archive as read-only
         container_cmd += ["-v", f"{exp_dir.absolute()}:/home/agent/archive:ro"]
         # Mount the new agent directory as the workdir
@@ -1081,37 +1396,77 @@ async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> N
             failure_reason = f"Meta agent exited with an error: {stderr[-2000:]}"
             return
 
-        # 5. Build the new agent's image, with its (possibly changed)
-        # requirements.txt. An agent whose image does not build cannot run.
-        built, build_stderr = await build_agent_image(
-            agent_image_tag(exp_id, child_id), child_code_dir
+        # What it took to create this agent, for cost accounting
+        usage = read_agent_usage(meta_log_dir, stdout)
+        if usage is None:
+            logger.warning(f"Meta agent reported no usage for agent {child_id}")
+            usage = {"tokens": 0, "cached_tokens": 0, "cost": 0.0, "time": 0.0}
+        else:
+            write_lineage(child_dir, usage=usage)
+        tokens, cached, cost, time = (
+            usage["tokens"], usage["cached_tokens"], usage["cost"], usage["time"]
+        )  # fmt: skip
+        percent_cached = cached / tokens * 100 if tokens > 0 else 0
+        logger.info(
+            f"meta-improvement (agent {child_id}) || tokens: {tokens} (cached: {percent_cached:.2f}%), cost: ${cost:.4f}, duration: {time:.2f}s"
         )
-        if not built:
-            logger.error(f"Image build failed for agent {child_id}: {build_stderr}")
-            failure_reason = f"Image build failed: {build_stderr[-2000:]}"
-            return
 
-        # The agent is usable; anything that goes wrong from here on (usage
-        # statistics, summaries) does not invalidate it.
+        fix_attempts = 0
+        while True:
+            # 5. Build the new agent's image, with its (possibly changed)
+            # requirements.txt. An agent whose image does not build cannot run.
+            image_tag = agent_image_tag(exp_id, child_id)
+            built, build_stderr = await build_agent_image(image_tag, child_code_dir)
+            if not built:
+                logger.error(f"Image build failed for agent {child_id}: {build_stderr}")
+                failure_reason = f"Image build failed: {build_stderr[-2000:]}"
+                return
+
+            # 6. Validate it: an agent that cannot run is not worth evaluating
+            if not gate.enabled:
+                break
+            result = await validate_agent(exp_id, exp_dir, child_id, gate, image_tag)
+            write_lineage(
+                child_dir,
+                gate={**result.to_dict(), "fix_attempts": fix_attempts},
+                tests_passed=result.tests_passed,
+            )
+            if result.passed:
+                break
+            logger.error(f"Agent {child_id}: {result.failure_reason()}")
+            if fix_attempts >= gate.retries:
+                status = STATUS_INVALID
+                failure_reason = result.failure_reason()
+                return
+
+            # Ask the meta agent to repair what it made, then build and
+            # validate again
+            fix_attempts += 1
+            logger.info(
+                f"Asking the meta agent to fix agent {child_id} (attempt {fix_attempts} of {gate.retries})"
+            )
+            fix_cmd = ["python", "-m", f"{agent_module}.agent"]
+            fix_cmd += ["--prompt", fix_prompt(result)]
+            fix_cmd += ["--workdir", "/home/agent/workdir"]
+            fix_cmd += ["--logdir", f"{container_meta_log_path}/gate_fix_{fix_attempts}"]
+            fix_cmd += ["--timeout", str(GATE_FIX_TIMEOUT_SECONDS)]
+            fix_cmd += ["--cost-threshold", str(GATE_FIX_COST_THRESHOLD_USD)]
+            fixed, _, fix_stderr = await run_docker_command(
+                *exec_cmd, container_name, *fix_cmd
+            )
+            if not fixed:
+                logger.warning(f"The fix attempt for agent {child_id} errored: {fix_stderr}")
+            # The fix is part of what it took to create this agent
+            fix_usage = read_usage(meta_log_dir / f"gate_fix_{fix_attempts}")
+            if fix_usage is not None:
+                usage = {key: usage[key] + fix_usage[key] for key in usage}
+                write_lineage(child_dir, usage=usage)
+
+        # The agent is usable; anything that goes wrong from here on
+        # (summaries) does not invalidate it.
         status, failure_reason = STATUS_OK, None
 
-        tokens, cached, cost, time = stdout.splitlines()[-1].split("|")
-        percent_cached = int(cached) / int(tokens) * 100 if int(tokens) > 0 else 0
-        # What it took to create this agent, for cost accounting
-        write_lineage(
-            child_dir,
-            usage={
-                "tokens": int(tokens),
-                "cached_tokens": int(cached),
-                "cost": float(cost),
-                "time": float(time),
-            },
-        )
-        logger.info(
-            f"meta-improvement (agent {child_id}) || tokens: {tokens} (cached: {percent_cached:.2f}%), cost: ${float(cost):.4f}, duration: {float(time):.2f}s"
-        )
-
-        # 6. Generate and save a summary for the meta-improvement logs
+        # 7. Generate and save a summary for the meta-improvement logs
         trace_path = meta_log_dir / "execution_tree.txt"
         if trace_path.exists():
             trace = trace_path.read_text()
@@ -1129,7 +1484,7 @@ async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> N
         meta_context = (
             f"The 'answer' actually pertains to whether the agent was successful (1) or errored out (0) during the meta-improvement task"
             f"Meta-improvement process used {tokens} tokens ({percent_cached:.2f}% cached), "
-            f"cost ${float(cost):.4f}, and took {float(time):.2f} seconds."
+            f"cost ${cost:.4f}, and took {time:.2f} seconds."
         )
         if stderr:
             meta_context += f"\nErrors encountered: {stderr}"
@@ -1168,7 +1523,7 @@ async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> N
             # Left 'pending', so that it is created afresh on resumption
             logger.warning(f"Creation of agent {child_id} was interrupted")
         else:
-            logger.error(f"Marking agent {child_id} as failed: {failure_reason}")
+            logger.error(f"Marking agent {child_id} as {status}: {failure_reason}")
             write_lineage(child_dir, status=status, failure_reason=failure_reason)
 
 
@@ -1211,7 +1566,7 @@ def set_aside_incomplete_agents(exp_dir: Path) -> None:
     for agent_id in get_agent_ids(exp_dir):
         agent_dir = exp_dir / f"agent_{agent_id}"
         record = read_lineage(agent_dir) or {}
-        if record.get("status") not in (STATUS_OK, STATUS_FAILED):
+        if record.get("status") not in FINISHED_STATUSES:
             set_aside(exp_dir, agent_dir)
 
 
@@ -1315,9 +1670,21 @@ async def evaluate_agent(
     with their results kept outside of the experiment directory.
     """
     agent_dir = exp_dir / f"agent_{agent_id}"
-    benchmarks = list(benchmark_registry.values())
+    unknown = [name for name in config.benchmarks if name not in benchmark_registry]
+    if unknown:
+        raise ValueError(f"Unknown benchmark(s): {', '.join(unknown)}")
+    benchmarks = [benchmark_registry[name] for name in config.benchmarks]
     image = await resolve_agent_image(exp_id, agent_id)
     seed = config.split_seed
+    # How every benchmark run of this agent is made
+    run_settings = dict(
+        image=image,
+        repeats=config.repeats,
+        subset_size=config.subset_size,
+        benchmark_seed=config.benchmark_seed,
+        timeout_s=config.timeout_s,
+        cost_limit_usd=config.cost_limit_usd,
+    )
 
     def dev(benchmark: BaseBenchmark) -> list[Problem]:
         return split_problems(
@@ -1344,9 +1711,8 @@ async def evaluate_agent(
             agent_dir,
             benchmarks,
             workers,
-            image=image,
             select_problems=stage1,
-            repeats=config.repeats,
+            **run_settings,
         )
         delta = ArchiveAnalyzer(exp_dir).paired_delta(agent_id, parent_id)
         evaluation = {
@@ -1380,9 +1746,8 @@ async def evaluate_agent(
         agent_dir,
         benchmarks,
         workers,
-        image=image,
         select_problems=dev,
-        repeats=config.repeats,
+        **run_settings,
     )
     if config.holdout_fraction > 0:
         logger.info(f"Running held-out benchmarks for agent {agent_id}")
@@ -1391,10 +1756,9 @@ async def evaluate_agent(
             agent_dir,
             benchmarks,
             workers,
-            image=image,
             results_exp_dir=holdout_dir(exp_dir),
             select_problems=holdout,
-            repeats=config.repeats,
+            **run_settings,
         )
 
 
@@ -1432,11 +1796,14 @@ async def run_search(
     config: EvaluationConfig = EvaluationConfig(),
     meta_agent: str | int = "best",
     meta_model: str | None = None,
+    gate: GateConfig = GateConfig(),
 ) -> None:
     """The self-improvement loop. In each generation: evaluate the agents that
     have not been evaluated yet, then create `n_children` new agents."""
     start_generation = load_search_state(exp_dir)["generation"]
     logger.info(f"Starting from generation {start_generation}")
+    if start_generation < iterations:
+        await check_initial_agent(exp_id, exp_dir, gate)
 
     for generation in range(start_generation, iterations):
         await evaluate_pending_agents(exp_id, exp_dir, workers, config)
@@ -1452,7 +1819,7 @@ async def run_search(
 
         def is_created(child: dict) -> bool:
             record = read_lineage(exp_dir / f"agent_{child['id']}") or {}
-            return record.get("status") in (STATUS_OK, STATUS_FAILED)
+            return record.get("status") in FINISHED_STATUSES
 
         todo = [child for child in plan if not is_created(child)]
         logger.info(
@@ -1460,7 +1827,7 @@ async def run_search(
             f"from parents {[c['parent_id'] for c in todo]}"
         )
         results = await asyncio.gather(
-            *(run_meta_agent_benchmark(exp_id, exp_dir, child) for child in todo),
+            *(run_meta_agent_benchmark(exp_id, exp_dir, child, gate) for child in todo),
             return_exceptions=True,
         )
         errors = [r for r in results if isinstance(r, BaseException)]
@@ -1508,6 +1875,10 @@ async def main():
     parser = setup_argparse()
     args = parser.parse_args()
     logger.debug(f"Setup parser: {args}")
+    try:
+        settings = settings_from_args(args)
+    except ValueError as e:
+        parser.error(str(e))
 
     # Either get the specified experiment id, or get the next one
     exp_id = args.experiment_id or get_next_dir_number("results")
@@ -1517,6 +1888,22 @@ async def main():
     if not exp_dir.exists():
         initialise_experiment(exp_dir)
         logger.info(f"Initialized experiment {exp_id} in {exp_dir}")
+
+    selection_seed = resolve_selection_seed(exp_dir, settings.seed)
+    try:
+        config = resolve_evaluation_config(
+            exp_dir,
+            selection_seed,
+            **{
+                name: getattr(settings, name)
+                for name in EvaluationConfig.__dataclass_fields__
+                if name in RunnerSettings.model_fields
+            },
+        )
+        check_meta_agent(exp_dir, settings.meta_agent)
+        gate = settings.gate
+    except ValueError as e:
+        parser.error(str(e))
 
     # Handle test mode
     if args.command == "test":
@@ -1537,51 +1924,52 @@ async def main():
             exp_dir,
             latest_agent,
             [benchmark_cls],
-            args.workers,
+            settings.workers,
             image=await resolve_agent_image(
                 exp_id, int(latest_agent.name.split("_")[1])
             ),
+            repeats=config.repeats,
+            subset_size=config.subset_size,
+            benchmark_seed=config.benchmark_seed,
+            timeout_s=config.timeout_s,
+            cost_limit_usd=config.cost_limit_usd,
         )
         return
 
-    if args.children < 1:
-        parser.error("--children must be at least 1")
-
-    selection_seed = resolve_selection_seed(exp_dir, args.seed)
-    logger.info(
-        f"Parent selection: {args.selection} (seed {selection_seed}), "
-        f"{args.children} new agent(s) per iteration"
-    )
-    try:
-        config = resolve_evaluation_config(
-            exp_dir,
-            selection_seed,
-            repeats=args.repeats,
-            holdout_fraction=args.holdout_fraction,
-            stage1_size=args.stage1_size,
-            promote_threshold=args.promote_threshold,
+    passed_on = [name for name in SANDBOX_ENV_VARS if os.environ.get(name)]
+    if passed_on:
+        logger.info(f"Passed on to the sandbox: {', '.join(passed_on)}")
+    else:
+        logger.warning(
+            "None of the provider API keys are set in this shell, so agents will "
+            f"not be able to call any model ({', '.join(SANDBOX_ENV_VARS)})"
         )
-    except ValueError as e:
-        parser.error(str(e))
-    logger.info(f"Evaluation: {config}")
-    try:
-        check_meta_agent(exp_dir, args.meta_agent)
-    except ValueError as e:
-        parser.error(str(e))
-    logger.info(
-        f"Meta agent: {args.meta_agent}, model: {args.meta_model or 'its own default'}"
+
+    # Keep a record of what this invocation was run with
+    update_metadata(
+        exp_dir, runner_settings={**settings.model_dump(), "seed": selection_seed}
     )
+    logger.info(
+        f"Parent selection: {settings.selection} (seed {selection_seed}), "
+        f"{settings.children} new agent(s) per iteration"
+    )
+    logger.info(f"Evaluation: {config}")
+    logger.info(
+        f"Meta agent: {settings.meta_agent}, model: {settings.meta_model or 'its own default'}"
+    )
+    logger.info(f"Validation gate: {gate}")
     await run_search(
         exp_id,
         exp_dir,
-        args.iterations,
-        args.workers,
-        n_children=args.children,
-        selection=args.selection,
+        settings.iterations,
+        settings.workers,
+        n_children=settings.children,
+        selection=settings.selection,
         seed=selection_seed,
         config=config,
-        meta_agent=args.meta_agent,
-        meta_model=args.meta_model,
+        meta_agent=settings.meta_agent,
+        meta_model=settings.meta_model,
+        gate=gate,
     )
 
 

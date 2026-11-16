@@ -124,6 +124,41 @@ async def test_stop_sequences_are_still_sent():
     assert request["stop_sequences"] == ["</TOOL_CALL>"]
 
 
+def empty_text_blocks(request):
+    return [
+        (i, j)
+        for i, m in enumerate(request["messages"])
+        for j, b in enumerate(m["content"])
+        if b["type"] == "text" and not b["text"].strip()
+    ]
+
+
+@pytest.mark.parametrize("blank", ["", "   \n"])
+@pytest.mark.asyncio
+async def test_empty_assistant_turn_is_dropped_not_given_a_cache_break_point(blank):
+    # A sub-agent's first step can arrive with nothing yet in its assistant turn.
+    # The API rejects an empty text block, and rejects cache_control on one.
+    messages = AGENT_STEP[:2] + [text("assistant", blank)]
+    request = await request_for(Model.SONNET_55, messages=messages)
+
+    assert empty_text_blocks(request) == []
+    assert [m["role"] for m in request["messages"]] == ["user"]
+    assert request["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+@pytest.mark.asyncio
+async def test_trailing_empty_text_block_is_dropped_from_a_turn():
+    messages = AGENT_STEP[:2] + [
+        Message(role="assistant", content=[TextContent(text="Looked at files."), TextContent(text="")])
+    ]
+    request = await request_for(Model.SONNET_55, messages=messages)
+
+    assert empty_text_blocks(request) == []
+    work_so_far = request["messages"][-2]
+    assert [b["text"] for b in work_so_far["content"]] == ["Looked at files."]
+    assert work_so_far["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
 @pytest.mark.asyncio
 async def test_empty_thinking_blocks_are_dropped():
     content = [

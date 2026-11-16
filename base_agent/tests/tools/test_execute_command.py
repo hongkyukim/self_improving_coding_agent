@@ -88,11 +88,12 @@ class TestExecuteCommand:
         assert "unique_file.txt" in result.output  # ls output
 
     @pytest.mark.asyncio
-    async def test_command_failure(self, mock_agent):
+    async def test_command_failure(self, mock_agent, temp_dir):
         """Test handling of commands that fail with non-zero exit code."""
         tool = ExecuteCommand(
             calling_agent=mock_agent,
             intent="Run command that fails",
+            directory_in_which_to_run_command=str(temp_dir),
             command="ls /nonexistent_directory",
             command_returns=True,
             generous_expected_duration=5.0,
@@ -221,7 +222,8 @@ class TestExecuteCommand:
     async def test_command_with_large_output(self, mock_agent, temp_dir):
         """Test handling commands that produce large outputs."""
         # Generate a command that produces a large output
-        command = "for i in {1..1000}; do echo \"Line $i of output\"; done"
+        # Use seq rather than {1..1000}: brace expansion is bash-only and /bin/sh is dash on CI
+        command = "for i in $(seq 1 1000); do echo \"Line $i of output\"; done"
 
         tool = ExecuteCommand(
             calling_agent=mock_agent,

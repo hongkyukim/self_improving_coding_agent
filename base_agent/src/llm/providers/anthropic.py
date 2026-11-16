@@ -374,26 +374,27 @@ class AnthropicProvider(BaseProvider):
                     }
                 )
 
-        for i in range(len(anthropic_messages)-1, 0, -1):
-            # Remove potential empty message blocks from the end
-            while hasattr(anthropic_messages[i]["content"][-1], "text") and anthropic_messages[i]["content"][-1].text == "":
-                messages[i].content.pop()
-
-            if len(messages[i].content) == 0:
-                messages.pop()
-
-            elif hasattr(anthropic_messages[i]["content"][-1], "text") and anthropic_messages[i]["content"][-1]["text"] != "":
-                break
+        # The API rejects text blocks that are empty or only whitespace (and
+        # cache_control on them), so drop those, and any message left with
+        # nothing in it.
+        for message in anthropic_messages:
+            message["content"] = [
+                block
+                for block in message["content"]
+                if not (block["type"] == "text" and not block["text"].strip())
+            ]
+        anthropic_messages = [m for m in anthropic_messages if m["content"]]
 
         # Ensure the last assistant message in the prefill doesn't have
         # trailing whitespace
-        if anthropic_messages[-1]["role"] == "assistant":
+        if anthropic_messages and anthropic_messages[-1]["role"] == "assistant":
             for block in reversed(anthropic_messages[-1]["content"]):
                 if block["type"] == "text":
                     block["text"] = block["text"].rstrip()
 
         # Default to setting a cache break point at the last message
-        anthropic_messages[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+        if anthropic_messages:
+            anthropic_messages[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
 
         # The agents send their work so far as an assistant turn for the model
         # to carry on from. Models that reject that get a user turn asking
@@ -402,6 +403,7 @@ class AnthropicProvider(BaseProvider):
         # closing turn would not be.
         if (
             model is not None
+            and anthropic_messages
             and not model.supports_prefill
             and anthropic_messages[-1]["role"] == "assistant"
         ):

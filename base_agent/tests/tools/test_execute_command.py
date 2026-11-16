@@ -222,7 +222,8 @@ class TestExecuteCommand:
     async def test_command_with_large_output(self, mock_agent, temp_dir):
         """Test handling commands that produce large outputs."""
         # Generate a command that produces a large output
-        command = "for i in {1..1000}; do echo \"Line $i of output\"; done"
+        # Use seq rather than {1..1000}: brace expansion is bash-only and /bin/sh is dash on CI
+        command = "for i in $(seq 1 1000); do echo \"Line $i of output\"; done"
 
         tool = ExecuteCommand(
             calling_agent=mock_agent,

@@ -88,11 +88,12 @@ class TestExecuteCommand:
         assert "unique_file.txt" in result.output  # ls output
 
     @pytest.mark.asyncio
-    async def test_command_failure(self, mock_agent):
+    async def test_command_failure(self, mock_agent, temp_dir):
         """Test handling of commands that fail with non-zero exit code."""
         tool = ExecuteCommand(
             calling_agent=mock_agent,
             intent="Run command that fails",
+            directory_in_which_to_run_command=str(temp_dir),
             command="ls /nonexistent_directory",
             command_returns=True,
             generous_expected_duration=5.0,

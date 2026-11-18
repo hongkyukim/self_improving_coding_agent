@@ -385,14 +385,21 @@ async def run_meta_agent_benchmark(
         if stderr:
             meta_context += f"\nErrors encountered: {stderr}"
 
-        summary = await evaluation.generate_contextual_summary(
-            problem_statement=problem_statement,
-            llm_answer=llm_answer,
-            trace=trace,
-            score=score,
-            parse_errors=None,
-            answer_discussion=meta_context,
-        )
+        try:
+            summary = await evaluation.generate_contextual_summary(
+                problem_statement=problem_statement,
+                llm_answer=llm_answer,
+                trace=trace,
+                score=score,
+                parse_errors=None,
+                answer_discussion=meta_context,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Summary generation failed for agent {child_id} "
+                f"(the agent is kept): {type(e).__name__}: {e}"
+            )
+            summary = f"(Summary unavailable: {type(e).__name__}: {e})"
 
         summary_path = meta_log_dir / "summary.txt"
         summary_path.write_text(summary)

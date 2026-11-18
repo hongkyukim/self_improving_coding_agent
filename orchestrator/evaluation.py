@@ -146,7 +146,7 @@ Keep your analysis concise (no more than 1-2 paragraphs max) but thorough.
             ),
             Message(role="user", content=[TextContent(text=summary_prompt)]),
         ],
-        model=Model.GEMINI_FLASH_2,
+        model=Model.HAIKU_55,
     )
 
     # Assume we'll get a single text completion
@@ -432,18 +432,30 @@ async def process_job(
             if timed_out:
                 timeout_context = f"\nNOTE: This execution was terminated after reaching the {TIMEOUT_SECONDS} second time budget limit."
 
-            summary = await generate_contextual_summary(
-                problem.statement,
-                llm_answer,
-                trace,
-                score,
-                parse_errors,
-                (
-                    answer_discussion + timeout_context
-                    if answer_discussion
-                    else timeout_context
-                ),
-            )
+            # The summary is auxiliary: the problem has already been scored and
+            # recorded, so an LLM failure here must not turn it into a failure.
+            try:
+                summary = await generate_contextual_summary(
+                    problem.statement,
+                    llm_answer,
+                    trace,
+                    score,
+                    parse_errors,
+                    (
+                        answer_discussion + timeout_context
+                        if answer_discussion
+                        else timeout_context
+                    ),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Summary generation failed for {job.result_id} "
+                    f"(score {score} is kept): {type(e).__name__}: {e}"
+                )
+                summary = (
+                    f"(Summary unavailable: {type(e).__name__}: {e})\n"
+                    f"Score: {score}"
+                )
 
             summary_path = logdir / "summary.txt"
             summary_path.write_text(summary)

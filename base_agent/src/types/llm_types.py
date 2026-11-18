@@ -492,7 +492,9 @@ class Model(Enum):
     )
 
     GEMINI_FLASH_2 = ModelInfo(
-        api_name="gemini-2.0-flash",
+        # gemini-2.0-flash was retired (HTTP 404); Google points to gemini-3.8-flash.
+        # NOTE: costs below are still the 2.0-flash prices; update from Google's pricing page.
+        api_name="gemini-3.8-flash",
         provider=Provider.GOOGLE_REST,
         costs=TokenCost(
             input_uncached=0.10,

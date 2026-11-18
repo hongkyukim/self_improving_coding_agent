@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 
 
+class GeminiFatalError(RuntimeError):
+    """Non-retryable Gemini API error (bad API key, permission denied, ...)."""
+
+
 class GoogleRESTProvider(BaseProvider):
 
     base_url = "https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
@@ -52,9 +56,32 @@ class GoogleRESTProvider(BaseProvider):
         # NOTE: the key isn't sent in the clear as a GET parameter thanks to HTTPS
         url = self.base_url.format(model_id=model, api_key=self._api_key)
         headers = {"Content-Type": "application/json"}
-        async with httpx.AsyncClient() as client:
+        # httpx's default timeout is 5s, far too short for LLM generations
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=15.0)) as client:
             response = await client.post(url, headers=headers, json=request_data)
-            return json.loads(response.text)
+            try:
+                body = json.loads(response.text)
+            except json.JSONDecodeError:
+                raise RuntimeError(
+                    f"Gemini returned non-JSON (HTTP {response.status_code}): "
+                    f"{response.text[:300]}"
+                )
+            # Surface API errors (429 quota, 5xx, invalid request...) instead of
+            # letting a body without 'candidates' blow up later as a KeyError.
+            if response.status_code >= 400 or (
+                isinstance(body, dict) and "error" in body
+            ):
+                err = body.get("error", body) if isinstance(body, dict) else body
+                msg = f"Gemini API error (HTTP {response.status_code}): {err}"
+                # 429 (rate limit) and 5xx are transient; other 4xx never succeed on retry
+                # (402 = prepaid credits depleted)
+                if response.status_code in (400, 401, 402, 403, 404):
+                    raise GeminiFatalError(
+                        f"{msg}. Not retryable: check GEMINI_API_KEY, the billing/"
+                        f"credits of its project, and that model '{model}' still exists."
+                    )
+                raise RuntimeError(msg)
+            return body
 
     def map_stop_reason(self, response: dict) -> tuple[StopReason, Optional[str]]:
         """Map provider-specific stop information to standard format.
@@ -240,8 +267,11 @@ class GoogleRESTProvider(BaseProvider):
         while response is None and retry < max_retries:
             try:
                 response = await self._make_request(data, model.id)
+            except GeminiFatalError:
+                raise
             except Exception as e:
-                logger.warning(f"Error in Gemini request: {str(e)}")
+                # str(e) is empty for e.g. httpx timeouts, so include the type
+                logger.warning(f"Error in Gemini request: {type(e).__name__}: {e}")
                 pass
 
             if response is None:
@@ -293,9 +323,16 @@ class GoogleRESTProvider(BaseProvider):
         stop_reason, stop_sequence = self.map_stop_reason(response)
 
         response_content = []
-        for candidate in response["candidates"]:
+        candidates = response.get("candidates")
+        if not candidates:
+            # e.g. prompt blocked by safety filters: no candidates returned
+            raise RuntimeError(
+                f"Gemini returned no candidates: {response.get('promptFeedback', response)}"
+            )
+        for candidate in candidates:
             response_content.append([])
-            for block in candidate["content"]["parts"]:
+            # content/parts can be missing (e.g. finishReason SAFETY / MAX_TOKENS)
+            for block in candidate.get("content", {}).get("parts", []):
                 if "text" in block:
                     response_content[-1].append(TextContent(text=block["text"]))
                 elif "functionCall" in block:
